@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"sort"
 	"strings"
 	"time"
 
@@ -474,6 +475,13 @@ func (o *Operator) sync(ctx context.Context, key string) error {
 		return err
 	}
 
+	logger.Debug("rule ConfigMaps prepared for mounting",
+		"namespace", tr.Namespace,
+		"thanos", tr.Name,
+		"configmaps", ruleConfigMapNames,
+		"count", len(ruleConfigMapNames),
+	)
+
 	assetStore := assets.NewStoreBuilder(o.kclient.CoreV1(), o.kclient.CoreV1())
 
 	if err := o.createOrUpdateRulerConfigSecret(ctx, assetStore, tr); err != nil {
@@ -509,6 +517,7 @@ func (o *Operator) sync(ctx context.Context, key string) error {
 	}
 
 	if existingStatefulSet == nil {
+		logger.Info("Creating new ThanosRuler StatefulSet", "name", prefixedName(tr.Name), "namespace", tr.Namespace, "rule_configmaps", ruleConfigMapNames)
 		ssetClient := o.kclient.AppsV1().StatefulSets(tr.Namespace)
 		sset, err := makeStatefulSet(tr, o.config, ruleConfigMapNames, "", tlsAssets)
 		if err != nil {
@@ -539,12 +548,55 @@ func (o *Operator) sync(ctx context.Context, key string) error {
 
 	operator.SanitizeSTS(sset)
 
-	if newSSetInputHash == existingStatefulSet.Annotations[operator.InputHashAnnotationName] {
-		logger.Debug("new statefulset generation inputs match current, skipping any actions", "hash", newSSetInputHash)
+	existingInputHash := existingStatefulSet.Annotations[operator.InputHashAnnotationName]
+	if newSSetInputHash == existingInputHash {
+		logger.Debug("ThanosRuler StatefulSet inputs unchanged, no update needed",
+			"namespace", tr.Namespace,
+			"statefulset", prefixedName(tr.Name),
+			"hash", newSSetInputHash,
+			"current_rule_configmaps", ruleConfigMapNames,
+		)
 		return nil
 	}
 
-	logger.Debug("new hash differs from the existing value", "new", newSSetInputHash, "existing", existingStatefulSet.Annotations[operator.InputHashAnnotationName])
+	logger.Info("Updating ThanosRuler StatefulSet due to input hash change",
+		"namespace", tr.Namespace,
+		"statefulset", prefixedName(tr.Name),
+		"old_hash", existingInputHash,
+		"new_hash", newSSetInputHash,
+	)
+
+	// Try to provide more specific reasons for the hash change by examining rule ConfigMaps
+	// Extract previously mounted rule ConfigMap names from the existing StatefulSet
+	previousRuleCMNames := []string{}
+	ruleCMNamePrefix := fmt.Sprintf("thanos-ruler-%s-rulefiles-", tr.Name)
+	for _, vol := range existingStatefulSet.Spec.Template.Spec.Volumes {
+		if vol.ConfigMap != nil && strings.HasPrefix(vol.Name, ruleCMNamePrefix) {
+			previousRuleCMNames = append(previousRuleCMNames, vol.Name)
+		}
+	}
+	sort.Strings(previousRuleCMNames)
+
+	// Sort current rule ConfigMap names for consistent comparison
+	sortedCurrentRuleCMNames := make([]string, len(ruleConfigMapNames))
+	copy(sortedCurrentRuleCMNames, ruleConfigMapNames)
+	sort.Strings(sortedCurrentRuleCMNames)
+
+	if !reflect.DeepEqual(previousRuleCMNames, sortedCurrentRuleCMNames) {
+		logger.Info("Rule ConfigMap set changed",
+			"namespace", tr.Namespace,
+			"statefulset", prefixedName(tr.Name),
+			"old_configmaps", previousRuleCMNames,
+			"new_configmaps", sortedCurrentRuleCMNames,
+		)
+	}
+
+	logger.Debug("StatefulSet hash comparison",
+		"namespace", tr.Namespace,
+		"statefulset", prefixedName(tr.Name),
+		"old_hash", existingInputHash,
+		"new_hash", newSSetInputHash,
+	)
 	ssetClient := o.kclient.AppsV1().StatefulSets(tr.Namespace)
 	err = k8sutil.UpdateStatefulSet(ctx, ssetClient, sset)
 	sErr, ok := err.(*apierrors.StatusError)
@@ -558,7 +610,14 @@ func (o *Operator) sync(ctx context.Context, key string) error {
 			failMsg[i] = cause.Message
 		}
 
-		logger.Info("recreating ThanosRuler StatefulSet because the update operation wasn't possible", "reason", strings.Join(failMsg, ", "))
+		logger.Info("recreating ThanosRuler StatefulSet because the update operation wasn't possible",
+			"namespace", tr.Namespace,
+			"statefulset", prefixedName(tr.Name),
+			"reason", strings.Join(failMsg, ", "),
+			"old_hash", existingInputHash,
+			"new_hash", newSSetInputHash,
+			"new_rule_configmaps", ruleConfigMapNames,
+		)
 		propagationPolicy := metav1.DeletePropagationForeground
 		if err := ssetClient.Delete(ctx, sset.GetName(), metav1.DeleteOptions{PropagationPolicy: &propagationPolicy}); err != nil {
 			return fmt.Errorf("failed to delete StatefulSet to avoid forbidden action: %w", err)
@@ -569,6 +628,13 @@ func (o *Operator) sync(ctx context.Context, key string) error {
 	if err != nil {
 		return fmt.Errorf("updating StatefulSet failed: %w", err)
 	}
+
+	logger.Info("ThanosRuler StatefulSet successfully updated",
+		"namespace", tr.Namespace,
+		"statefulset", prefixedName(tr.Name),
+		"new_hash", newSSetInputHash,
+		"rule_configmaps", ruleConfigMapNames,
+	)
 
 	return nil
 }

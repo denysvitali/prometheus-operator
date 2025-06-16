@@ -102,6 +102,16 @@ func (o *Operator) createOrUpdateRuleConfigMaps(ctx context.Context, t *monitori
 		return currentConfigMapNames, nil
 	}
 
+	// Log when rules change to help understand why ConfigMaps are being updated
+	if !equal {
+		o.logger.Info("PrometheusRules changed, will update rule ConfigMaps",
+			"namespace", t.Namespace,
+			"thanos", t.Name,
+			"current_rules_count", len(currentRules),
+			"new_rules_count", len(newRules),
+		)
+	}
+
 	newConfigMaps, err := makeRulesConfigMaps(
 		t,
 		newRules,
@@ -118,9 +128,10 @@ func (o *Operator) createOrUpdateRuleConfigMaps(ctx context.Context, t *monitori
 	}
 
 	if len(currentConfigMaps) == 0 {
-		o.logger.Debug("no PrometheusRule configmap found, creating new one",
+		o.logger.Info("no existing PrometheusRule ConfigMaps found, creating new ones",
 			"namespace", t.Namespace,
 			"thanos", t.Name,
+			"configmaps_to_create", newConfigMapNames,
 		)
 		for _, cm := range newConfigMaps {
 			_, err = cClient.Create(ctx, &cm, metav1.CreateOptions{})
@@ -133,6 +144,18 @@ func (o *Operator) createOrUpdateRuleConfigMaps(ctx context.Context, t *monitori
 
 	// Simply deleting old ConfigMaps and creating new ones for now. Could be
 	// replaced by logic that only deletes obsolete ConfigMaps in the future.
+	oldConfigMapNames := make([]string, 0, len(currentConfigMaps))
+	for _, cm := range currentConfigMaps {
+		oldConfigMapNames = append(oldConfigMapNames, cm.Name)
+	}
+
+	o.logger.Info("replacing PrometheusRule ConfigMaps",
+		"namespace", t.Namespace,
+		"thanos", t.Name,
+		"old_configmaps", oldConfigMapNames,
+		"new_configmaps", newConfigMapNames,
+	)
+
 	for _, cm := range currentConfigMaps {
 		err := cClient.Delete(ctx, cm.Name, metav1.DeleteOptions{})
 		if err != nil {
