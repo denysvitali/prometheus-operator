@@ -28,6 +28,8 @@ import (
 	"github.com/mitchellh/hashstructure"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -41,6 +43,7 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 
+	"github.com/prometheus-operator/prometheus-operator/internal/telemetry"
 	"github.com/prometheus-operator/prometheus-operator/pkg/alertmanager/clustertlsconfig"
 	"github.com/prometheus-operator/prometheus-operator/pkg/alertmanager/validation"
 	validationv1alpha1 "github.com/prometheus-operator/prometheus-operator/pkg/alertmanager/validation/v1alpha1"
@@ -83,7 +86,9 @@ type Operator struct {
 
 	controllerID string
 
-	logger   *slog.Logger
+	logger *slog.Logger
+	tracer trace.Tracer
+
 	accessor *operator.Accessor
 
 	nsAlrtInf    cache.SharedIndexInformer
@@ -144,7 +149,9 @@ func New(ctx context.Context, restConfig *rest.Config, c operator.Config, logger
 		mclient:    mclient,
 		ssarClient: client.AuthorizationV1().SelfSubjectAccessReviews(),
 
-		logger:   logger,
+		logger: logger,
+		tracer: telemetry.GetComponentTracer("alertmanager-operator", "alertmanager-operator"),
+
 		accessor: operator.NewAccessor(logger),
 
 		metrics:         operator.NewMetrics(r),
@@ -506,14 +513,22 @@ func (c *Operator) handleNamespaceUpdate(oldo, curo interface{}) {
 
 // Sync implements the operator.Syncer interface.
 func (c *Operator) Sync(ctx context.Context, key string) error {
+	ctx, span := c.tracer.Start(ctx, "Sync")
+	defer span.End()
+
 	err := c.sync(ctx, key)
+	if err != nil {
+		span.RecordError(err)
+	}
 	c.reconciliations.SetStatus(key, err)
 
 	return err
-
 }
 
 func (c *Operator) sync(ctx context.Context, key string) error {
+	ctx, span := c.tracer.Start(ctx, "sync")
+	defer span.End()
+
 	aobj, err := c.alrtInfs.Get(key)
 
 	if apierrors.IsNotFound(err) {
@@ -552,15 +567,18 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 	assetStore := assets.NewStoreBuilder(c.kclient.CoreV1(), c.kclient.CoreV1())
 
 	if err := c.provisionAlertmanagerConfiguration(ctx, am, assetStore); err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("provision alertmanager configuration: %w", err)
 	}
 
 	tlsShardedSecret, err := operator.ReconcileShardedSecret(ctx, assetStore.TLSAssets(), c.kclient, c.newTLSAssetSecret(am))
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to reconcile the TLS secrets: %w", err)
 	}
 
 	if err := c.createOrUpdateWebConfigSecret(ctx, am); err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to synchronize the web config secret: %w", err)
 	}
 
@@ -568,6 +586,7 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 	// the cluster TLS configuration to trigger a rollout of the pods (this
 	// configuration doesn't support live reload).
 	if err := c.createOrUpdateClusterTLSConfigSecret(ctx, am); err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to synchronize the cluster TLS config secret: %w", err)
 	}
 
@@ -575,17 +594,20 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 	if am.Spec.ServiceName != nil {
 		selectorLabels := makeSelectorLabels(am.Name)
 		if err := k8sutil.EnsureCustomGoverningService(ctx, am.Namespace, *am.Spec.ServiceName, svcClient, selectorLabels); err != nil {
+			span.RecordError(err)
 			return err
 		}
 	} else {
 		// Create governing service if it doesn't exist.
 		if _, err = k8sutil.CreateOrUpdateService(ctx, svcClient, makeStatefulSetService(am, c.config)); err != nil {
+			span.RecordError(err)
 			return fmt.Errorf("synchronizing governing service failed: %w", err)
 		}
 	}
 
 	existingStatefulSet, err := c.getStatefulSetFromAlertmanagerKey(key)
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
 
@@ -601,11 +623,13 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 
 	newSSetInputHash, err := createSSetInputHash(*am, c.config, tlsShardedSecret, existingStatefulSet.Spec)
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
 
 	sset, err := makeStatefulSet(logger, am, c.config, newSSetInputHash, tlsShardedSecret)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to generate statefulset: %w", err)
 	}
 	operator.SanitizeSTS(sset)
@@ -620,6 +644,7 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 		logger.Debug("no current statefulset found")
 		logger.Debug("creating statefulset")
 		if _, err := ssetClient.Create(ctx, sset, metav1.CreateOptions{}); err != nil {
+			span.RecordError(err)
 			return fmt.Errorf("creating statefulset failed: %w", err)
 		}
 		return nil
@@ -640,12 +665,14 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 		logger.Info("recreating Alertmanager StatefulSet because the update operation wasn't possible", "reason", strings.Join(failMsg, ", "))
 		propagationPolicy := metav1.DeletePropagationForeground
 		if err := ssetClient.Delete(ctx, sset.GetName(), metav1.DeleteOptions{PropagationPolicy: &propagationPolicy}); err != nil {
+			span.RecordError(err)
 			return fmt.Errorf("failed to delete StatefulSet to avoid forbidden action: %w", err)
 		}
 		return nil
 	}
 
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("updating StatefulSet failed: %w", err)
 	}
 
@@ -689,8 +716,12 @@ func (c *Operator) getStatefulSetFromAlertmanagerKey(key string) (*appsv1.Statef
 // key.
 // UpdateStatus implements the operator.Syncer interface.
 func (c *Operator) UpdateStatus(ctx context.Context, key string) error {
+	ctx, span := c.tracer.Start(ctx, "UpdateStatus")
+	defer span.End()
+
 	a, err := c.getAlertmanagerFromKey(key)
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
 
@@ -700,6 +731,7 @@ func (c *Operator) UpdateStatus(ctx context.Context, key string) error {
 
 	sset, err := c.getStatefulSetFromAlertmanagerKey(key)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to get StatefulSet: %w", err)
 	}
 
@@ -709,12 +741,14 @@ func (c *Operator) UpdateStatus(ctx context.Context, key string) error {
 
 	stsReporter, err := operator.NewStatefulSetReporter(ctx, c.kclient, sset)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to retrieve statefulset state: %w", err)
 	}
 
 	selectorLabels := makeSelectorLabels(a.Name)
 	selector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{MatchLabels: selectorLabels})
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to create selector for alertmanager scale status: %w", err)
 	}
 
@@ -728,6 +762,7 @@ func (c *Operator) UpdateStatus(ctx context.Context, key string) error {
 		c.logger.Info("failed to apply alertmanager status subresource, trying again without scale fields", "err", err)
 		// Try again, but this time does not update scale subresource.
 		if _, err = c.mclient.MonitoringV1().Alertmanagers(a.Namespace).ApplyStatus(ctx, ApplyConfigurationFromAlertmanager(a, false), metav1.ApplyOptions{FieldManager: operator.PrometheusOperatorFieldManager, Force: true}); err != nil {
+			span.RecordError(err)
 			return fmt.Errorf("failed to apply alertmanager status subresource: %w", err)
 		}
 	}
@@ -921,6 +956,9 @@ func (c *Operator) provisionAlertmanagerConfiguration(ctx context.Context, am *m
 }
 
 func (c *Operator) createOrUpdateGeneratedConfigSecret(ctx context.Context, am *monitoringv1.Alertmanager, conf []byte, additionalData map[string][]byte) error {
+	ctx, span := c.tracer.Start(ctx, "createOrUpdateGeneratedConfigSecret", trace.WithAttributes(attribute.String("namespace", am.Namespace)))
+	defer span.End()
+
 	generatedConfigSecret := &v1.Secret{
 		Data: map[string][]byte{},
 	}
@@ -939,13 +977,15 @@ func (c *Operator) createOrUpdateGeneratedConfigSecret(ctx context.Context, am *
 	// Compress config to avoid 1mb secret limit for a while
 	var buf bytes.Buffer
 	if err := operator.GzipConfig(&buf, conf); err != nil {
-		return fmt.Errorf("couldnt gzip config: %w", err)
+		span.RecordError(err)
+		return fmt.Errorf("couldn't gzip config: %w", err)
 	}
 	generatedConfigSecret.Data[alertmanagerConfigFileCompressed] = buf.Bytes()
 
 	sClient := c.kclient.CoreV1().Secrets(am.Namespace)
 	err := k8sutil.CreateOrUpdateSecret(ctx, sClient, generatedConfigSecret)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to update generated config secret: %w", err)
 	}
 
@@ -1720,6 +1760,9 @@ func (c *Operator) newTLSAssetSecret(am *monitoringv1.Alertmanager) *v1.Secret {
 }
 
 func (c *Operator) createOrUpdateWebConfigSecret(ctx context.Context, a *monitoringv1.Alertmanager) error {
+	ctx, span := c.tracer.Start(ctx, "createOrUpdateWebConfigSecret", trace.WithAttributes(attribute.String("namespace", a.Namespace)))
+	defer span.End()
+
 	var fields monitoringv1.WebConfigFileFields
 	if a.Spec.Web != nil {
 		fields = a.Spec.Web.WebConfigFileFields
@@ -1731,6 +1774,7 @@ func (c *Operator) createOrUpdateWebConfigSecret(ctx context.Context, a *monitor
 		fields,
 	)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to initialize web config: %w", err)
 	}
 
@@ -1743,6 +1787,7 @@ func (c *Operator) createOrUpdateWebConfigSecret(ctx context.Context, a *monitor
 	)
 
 	if err := webConfig.CreateOrUpdateWebConfigSecret(ctx, c.kclient.CoreV1().Secrets(a.Namespace), s); err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to reconcile web config secret: %w", err)
 	}
 
@@ -1750,13 +1795,18 @@ func (c *Operator) createOrUpdateWebConfigSecret(ctx context.Context, a *monitor
 }
 
 func (c *Operator) createOrUpdateClusterTLSConfigSecret(ctx context.Context, a *monitoringv1.Alertmanager) error {
+	ctx, span := c.tracer.Start(ctx, "createOrUpdateClusterTLSConfigSecret", trace.WithAttributes(attribute.String("namespace", a.Namespace)))
+	defer span.End()
+
 	clusterTLSConfig, err := clustertlsconfig.New(clusterTLSConfigDir, a)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to initialize the configuration: %w", err)
 	}
 
 	data, err := clusterTLSConfig.ClusterTLSConfiguration()
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to generate the configuration: %w", err)
 	}
 
@@ -1776,6 +1826,7 @@ func (c *Operator) createOrUpdateClusterTLSConfigSecret(ctx context.Context, a *
 	)
 
 	if err = k8sutil.CreateOrUpdateSecret(ctx, c.kclient.CoreV1().Secrets(a.Namespace), s); err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to reconcile secret: %w", err)
 	}
 

@@ -45,6 +45,7 @@ import (
 	"github.com/prometheus-operator/prometheus-operator/internal/goruntime"
 	logging "github.com/prometheus-operator/prometheus-operator/internal/log"
 	"github.com/prometheus-operator/prometheus-operator/internal/metrics"
+	"github.com/prometheus-operator/prometheus-operator/internal/telemetry"
 	"github.com/prometheus-operator/prometheus-operator/pkg/admission"
 	alertmanagercontroller "github.com/prometheus-operator/prometheus-operator/pkg/alertmanager"
 	"github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring"
@@ -228,6 +229,20 @@ func run(fs *flag.FlagSet) int {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	wg, ctx := errgroup.WithContext(ctx)
+
+	// Initialize OpenTelemetry
+	otelTelemetry, err := telemetry.Setup(ctx, "prometheus-operator", version.Version, logger)
+	if err != nil {
+		logger.Error("failed to initialize OpenTelemetry", "err", err)
+		cancel()
+		return 1
+	}
+	defer func() {
+		if err := otelTelemetry.Shutdown(ctx); err != nil {
+			logger.Error("failed to shutdown OpenTelemetry", "err", err)
+		}
+	}()
+
 	r := metrics.NewRegistry("prometheus_operator")
 
 	k8sutil.MustRegisterClientGoMetrics(r)
@@ -243,6 +258,9 @@ func run(fs *flag.FlagSet) int {
 		cancel()
 		return 1
 	}
+
+	// Instrument Kubernetes client with OpenTelemetry for automatic tracing
+	telemetry.InstrumentKubernetesConfig(restConfig, "prometheus-operator")
 
 	kclient, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
@@ -607,7 +625,10 @@ func run(fs *flag.FlagSet) int {
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	srv, err := server.NewServer(logger, &serverConfig, mux)
+	// Wrap the mux with OpenTelemetry HTTP instrumentation
+	instrumentedHandler := telemetry.WrapHTTPMux(mux)
+
+	srv, err := server.NewServer(logger, &serverConfig, instrumentedHandler)
 	if err != nil {
 		logger.Error("failed to create web server", "err", err)
 		cancel()

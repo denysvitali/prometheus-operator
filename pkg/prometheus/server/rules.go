@@ -20,22 +20,28 @@ import (
 	"reflect"
 	"strings"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/prometheus-operator/prometheus-operator/internal/util"
 	"github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	namespacelabeler "github.com/prometheus-operator/prometheus-operator/pkg/namespacelabeler"
+	"github.com/prometheus-operator/prometheus-operator/pkg/namespacelabeler"
 	"github.com/prometheus-operator/prometheus-operator/pkg/operator"
 	prompkg "github.com/prometheus-operator/prometheus-operator/pkg/prometheus"
 )
 
 func (c *Operator) createOrUpdateRuleConfigMaps(ctx context.Context, p *monitoringv1.Prometheus) ([]string, error) {
+	ctx, span := c.tracer.Start(ctx, "createOrUpdateRuleConfigMaps", trace.WithAttributes(attribute.String("namespace", p.Namespace)))
+	defer span.End()
+
 	cClient := c.kclient.CoreV1().ConfigMaps(p.Namespace)
 
 	namespaces, err := c.selectRuleNamespaces(p)
 	if err != nil {
+		span.RecordError(err)
 		return nil, err
 	}
 
@@ -192,7 +198,6 @@ func (c *Operator) selectRuleNamespaces(p *monitoringv1.Prometheus) ([]string, e
 // simplicity should be sufficient.
 // [1] https://en.wikipedia.org/wiki/Bin_packing_problem#First-fit_algorithm
 func makeRulesConfigMaps(p *monitoringv1.Prometheus, ruleFiles map[string]string, opts ...operator.ObjectOption) ([]v1.ConfigMap, error) {
-
 	buckets := []map[string]string{
 		{},
 	}

@@ -24,6 +24,8 @@ import (
 
 	"github.com/mitchellh/hashstructure"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -38,6 +40,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 
+	"github.com/prometheus-operator/prometheus-operator/internal/telemetry"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	monitoringv1alpha1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1alpha1"
 	"github.com/prometheus-operator/prometheus-operator/pkg/assets"
@@ -62,7 +65,9 @@ type Operator struct {
 	mdClient metadata.Interface
 	mclient  monitoringclient.Interface
 
-	logger   *slog.Logger
+	logger *slog.Logger
+	tracer trace.Tracer
+
 	accessor *operator.Accessor
 	config   prompkg.Config
 
@@ -156,6 +161,7 @@ func New(ctx context.Context, restConfig *rest.Config, c operator.Config, logger
 		mdClient: mdClient,
 		mclient:  mclient,
 		logger:   logger,
+		tracer:   telemetry.GetComponentTracer("prometheus-server-operator", "prometheus-server-operator"),
 		accessor: operator.NewAccessor(logger),
 
 		config: prompkg.Config{
@@ -726,13 +732,22 @@ func (c *Operator) handleMonitorNamespaceUpdate(oldo, curo interface{}) {
 
 // Sync implements the operator.Syncer interface.
 func (c *Operator) Sync(ctx context.Context, key string) error {
+	ctx, span := c.tracer.Start(ctx, "Sync")
+	defer span.End()
+
 	err := c.sync(ctx, key)
+	if err != nil {
+		span.RecordError(err)
+	}
 	c.reconciliations.SetStatus(key, err)
 
 	return err
 }
 
 func (c *Operator) sync(ctx context.Context, key string) error {
+	ctx, span := c.tracer.Start(ctx, "sync")
+	defer span.End()
+
 	pobj, err := c.promInfs.Get(key)
 
 	if apierrors.IsNotFound(err) {
@@ -741,12 +756,14 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 		return nil
 	}
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
 
 	p := pobj.(*monitoringv1.Prometheus)
 	p = p.DeepCopy()
 	if err := k8sutil.AddTypeInformationToObject(p); err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to set Prometheus type information: %w", err)
 	}
 
@@ -759,6 +776,7 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 	}
 
 	if err := operator.CheckStorageClass(ctx, c.canReadStorageClass, c.kclient, p.Spec.Storage); err != nil {
+		span.RecordError(err)
 		return err
 	}
 
@@ -768,6 +786,8 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 	}
 
 	logger.Info("sync prometheus")
+
+	// Create rule configuration maps
 	ruleConfigMapNames, err := c.createOrUpdateRuleConfigMaps(ctx, p)
 	if err != nil {
 		return err
@@ -781,23 +801,29 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 	}
 	cg, err := prompkg.NewConfigGenerator(logger, p, opts...)
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
 
+	// Create configuration secret
 	if err := c.createOrUpdateConfigurationSecret(ctx, p, cg, ruleConfigMapNames, assetStore); err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("creating config failed: %w", err)
 	}
 
 	tlsAssets, err := operator.ReconcileShardedSecret(ctx, assetStore.TLSAssets(), c.kclient, prompkg.NewTLSAssetSecret(p, c.config))
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to reconcile the TLS secrets: %w", err)
 	}
 
 	if err := c.createOrUpdateWebConfigSecret(ctx, p); err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("synchronizing web config secret failed: %w", err)
 	}
 
 	if err := c.createOrUpdateThanosConfigSecret(ctx, p); err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to reconcile Thanos config secret: %w", err)
 	}
 
@@ -806,6 +832,7 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 		selectorLabels := makeSelectorLabels(p.Name)
 
 		if err := k8sutil.EnsureCustomGoverningService(ctx, p.Namespace, *p.Spec.ServiceName, svcClient, selectorLabels); err != nil {
+			span.RecordError(err)
 			return err
 		}
 	} else {
@@ -826,6 +853,7 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 		}
 
 		if _, err := k8sutil.CreateOrUpdateService(ctx, c.kclient.CoreV1().Services(p.Namespace), svc); err != nil {
+			span.RecordError(err)
 			return fmt.Errorf("synchronizing default governing service failed: %w", err)
 		}
 	}
@@ -834,6 +862,13 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 
 	// Ensure we have a StatefulSet running Prometheus deployed and that StatefulSet names are created correctly.
 	expected := prompkg.ExpectedStatefulSetShardNames(p)
+
+	// Reconcile StatefulSets
+	ctx, ssetSpan := c.tracer.Start(ctx, "reconcileStatefulSets", trace.WithAttributes(
+		attribute.String("namespace", p.Namespace),
+		attribute.Int("statefulset_shard_count", len(expected))))
+	defer ssetSpan.End()
+
 	for shard, ssetName := range expected {
 		logger := logger.With("statefulset", ssetName, "shard", fmt.Sprintf("%d", shard))
 		logger.Debug("reconciling statefulset")
@@ -843,6 +878,7 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 		if err != nil {
 			notFound = apierrors.IsNotFound(err)
 			if !notFound {
+				span.RecordError(err)
 				return fmt.Errorf("retrieving statefulset failed: %w", err)
 			}
 		}
@@ -864,6 +900,7 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 
 		newSSetInputHash, err := createSSetInputHash(*p, c.config, ruleConfigMapNames, tlsAssets, existingStatefulSet.Spec)
 		if err != nil {
+			span.RecordError(err)
 			return err
 		}
 
@@ -877,6 +914,7 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 			int32(shard),
 			tlsAssets)
 		if err != nil {
+			span.RecordError(err)
 			return fmt.Errorf("making statefulset failed: %w", err)
 		}
 		operator.SanitizeSTS(sset)
@@ -884,6 +922,7 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 		if notFound {
 			logger.Debug("creating statefulset")
 			if _, err := ssetClient.Create(ctx, sset, metav1.CreateOptions{}); err != nil {
+				span.RecordError(err)
 				return fmt.Errorf("creating statefulset failed: %w", err)
 			}
 			continue
@@ -916,12 +955,14 @@ func (c *Operator) sync(ctx context.Context, key string) error {
 
 			propagationPolicy := metav1.DeletePropagationForeground
 			if err := ssetClient.Delete(ctx, sset.GetName(), metav1.DeleteOptions{PropagationPolicy: &propagationPolicy}); err != nil {
+				span.RecordError(err)
 				return fmt.Errorf("failed to delete StatefulSet to avoid forbidden action: %w", err)
 			}
 			continue
 		}
 
 		if err != nil {
+			span.RecordError(err)
 			return fmt.Errorf("updating StatefulSet failed: %w", err)
 		}
 	}
@@ -983,12 +1024,16 @@ func (c *Operator) shouldRetain(p *monitoringv1.Prometheus) (bool, error) {
 // key.
 // UpdateStatus implements the operator.Syncer interface.
 func (c *Operator) UpdateStatus(ctx context.Context, key string) error {
+	ctx, span := c.tracer.Start(ctx, "UpdateStatus")
+	defer span.End()
+
 	pobj, err := c.promInfs.Get(key)
 
 	if apierrors.IsNotFound(err) {
 		return nil
 	}
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
 
@@ -997,6 +1042,7 @@ func (c *Operator) UpdateStatus(ctx context.Context, key string) error {
 
 	pStatus, err := c.statusReporter.Process(ctx, p, key)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to get prometheus status: %w", err)
 	}
 
@@ -1004,6 +1050,7 @@ func (c *Operator) UpdateStatus(ctx context.Context, key string) error {
 	selectorLabels := makeSelectorLabels(p.Name)
 	selector, err := metav1.LabelSelectorAsSelector(&metav1.LabelSelector{MatchLabels: selectorLabels})
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to create selector for prometheus scale status: %w", err)
 	}
 	p.Status.Selector = selector.String()
@@ -1013,6 +1060,7 @@ func (c *Operator) UpdateStatus(ctx context.Context, key string) error {
 		c.logger.Info("failed to apply prometheus status subresource, trying again without scale fields", "err", err)
 		// Try again, but this time does not update scale subresource.
 		if _, err = c.mclient.MonitoringV1().Prometheuses(p.Namespace).ApplyStatus(ctx, prompkg.ApplyConfigurationFromPrometheus(p, false), metav1.ApplyOptions{FieldManager: operator.PrometheusOperatorFieldManager, Force: true}); err != nil {
+			span.RecordError(err)
 			return fmt.Errorf("failed to apply prometheus status subresource: %w", err)
 		}
 	}
@@ -1110,6 +1158,9 @@ func ListOptions(name string) metav1.ListOptions {
 }
 
 func (c *Operator) createOrUpdateConfigurationSecret(ctx context.Context, p *monitoringv1.Prometheus, cg *prompkg.ConfigGenerator, ruleConfigMapNames []string, store *assets.StoreBuilder) error {
+	ctx, span := c.tracer.Start(ctx, "createOrUpdateConfigurationSecret", trace.WithAttributes(attribute.String("namespace", p.Namespace)))
+	defer span.End()
+
 	// If no service or pod monitor selectors are configured, the user wants to
 	// manage configuration themselves. Do create an empty Secret if it doesn't
 	// exist.
@@ -1236,6 +1287,9 @@ func (c *Operator) createOrUpdateConfigurationSecret(ctx context.Context, p *mon
 }
 
 func (c *Operator) createOrUpdateWebConfigSecret(ctx context.Context, p *monitoringv1.Prometheus) error {
+	ctx, span := c.tracer.Start(ctx, "createOrUpdateWebConfigSecret", trace.WithAttributes(attribute.String("namespace", p.Namespace)))
+	defer span.End()
+
 	var fields monitoringv1.WebConfigFileFields
 	if p.Spec.Web != nil {
 		fields = p.Spec.Web.WebConfigFileFields
@@ -1266,6 +1320,9 @@ func (c *Operator) createOrUpdateWebConfigSecret(ctx context.Context, p *monitor
 }
 
 func (c *Operator) createOrUpdateThanosConfigSecret(ctx context.Context, p *monitoringv1.Prometheus) error {
+	ctx, span := c.tracer.Start(ctx, "createOrUpdateThanosConfigSecret", trace.WithAttributes(attribute.String("namespace", p.Namespace)))
+	defer span.End()
+
 	secret, err := buildPrometheusHTTPClientConfigSecret(p)
 	if err != nil {
 		return fmt.Errorf("failed to build Thanos HTTP client config secret: :%w", err)

@@ -25,6 +25,8 @@ import (
 	"github.com/blang/semver/v4"
 	"github.com/mitchellh/hashstructure"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"gopkg.in/yaml.v2"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
@@ -39,6 +41,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 
+	"github.com/prometheus-operator/prometheus-operator/internal/telemetry"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	"github.com/prometheus-operator/prometheus-operator/pkg/assets"
 	monitoringv1ac "github.com/prometheus-operator/prometheus-operator/pkg/client/applyconfiguration/monitoring/v1"
@@ -67,7 +70,9 @@ type Operator struct {
 	mdClient metadata.Interface
 	mclient  monitoringclient.Interface
 
-	logger   *slog.Logger
+	logger *slog.Logger
+	tracer trace.Tracer
+
 	accessor *operator.Accessor
 
 	controllerID string
@@ -139,6 +144,7 @@ func New(ctx context.Context, restConfig *rest.Config, c operator.Config, logger
 		mdClient:        mdClient,
 		mclient:         mclient,
 		logger:          logger,
+		tracer:          telemetry.GetComponentTracer("thanos-ruler-operator", "thanos-ruler-operator"),
 		accessor:        operator.NewAccessor(logger),
 		metrics:         operator.NewMetrics(r),
 		eventRecorder:   c.EventRecorderFactory(client, controllerName),
@@ -430,13 +436,22 @@ func (o *Operator) handleNamespaceUpdate(oldo, curo interface{}) {
 
 // Sync implements the operator.Syncer interface.
 func (o *Operator) Sync(ctx context.Context, key string) error {
+	ctx, span := o.tracer.Start(ctx, "Sync")
+	defer span.End()
+
 	err := o.sync(ctx, key)
+	if err != nil {
+		span.RecordError(err)
+	}
 	o.reconciliations.SetStatus(key, err)
 
 	return err
 }
 
 func (o *Operator) sync(ctx context.Context, key string) error {
+	ctx, span := o.tracer.Start(ctx, "sync")
+	defer span.End()
+
 	trobj, err := o.thanosRulerInfs.Get(key)
 	if apierrors.IsNotFound(err) {
 		o.reconciliations.ForgetObject(key)
@@ -477,15 +492,18 @@ func (o *Operator) sync(ctx context.Context, key string) error {
 	assetStore := assets.NewStoreBuilder(o.kclient.CoreV1(), o.kclient.CoreV1())
 
 	if err := o.createOrUpdateRulerConfigSecret(ctx, assetStore, tr); err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to synchronize ruler config secret: %w", err)
 	}
 
 	tlsAssets, err := operator.ReconcileShardedSecret(ctx, assetStore.TLSAssets(), o.kclient, newTLSAssetSecret(tr, o.config))
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to reconcile the TLS secrets: %w", err)
 	}
 
 	if err := o.createOrUpdateWebConfigSecret(ctx, tr); err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to synchronize web config secret: %w", err)
 	}
 
@@ -493,11 +511,13 @@ func (o *Operator) sync(ctx context.Context, key string) error {
 	if tr.Spec.ServiceName != nil {
 		selectorLabels := makeSelectorLabels(tr.Name)
 		if err := k8sutil.EnsureCustomGoverningService(ctx, tr.Namespace, *tr.Spec.ServiceName, svcClient, selectorLabels); err != nil {
+			span.RecordError(err)
 			return err
 		}
 	} else {
 		// Create governing service if it doesn't exist.
 		if _, err = k8sutil.CreateOrUpdateService(ctx, svcClient, makeStatefulSetService(tr, o.config)); err != nil {
+			span.RecordError(err)
 			return fmt.Errorf("synchronizing governing service failed: %w", err)
 		}
 	}
@@ -505,6 +525,7 @@ func (o *Operator) sync(ctx context.Context, key string) error {
 	// Ensure we have a StatefulSet running Thanos deployed.
 	existingStatefulSet, err := o.getStatefulSetFromThanosRulerKey(key)
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
 
@@ -512,11 +533,13 @@ func (o *Operator) sync(ctx context.Context, key string) error {
 		ssetClient := o.kclient.AppsV1().StatefulSets(tr.Namespace)
 		sset, err := makeStatefulSet(tr, o.config, ruleConfigMapNames, "", tlsAssets)
 		if err != nil {
+			span.RecordError(err)
 			return fmt.Errorf("making thanos statefulset config failed: %w", err)
 		}
 
 		operator.SanitizeSTS(sset)
 		if _, err := ssetClient.Create(ctx, sset, metav1.CreateOptions{}); err != nil {
+			span.RecordError(err)
 			return fmt.Errorf("creating thanos statefulset failed: %w", err)
 		}
 
@@ -529,11 +552,13 @@ func (o *Operator) sync(ctx context.Context, key string) error {
 
 	newSSetInputHash, err := createSSetInputHash(*tr, o.config, tlsAssets, ruleConfigMapNames, existingStatefulSet.Spec)
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
 
 	sset, err := makeStatefulSet(tr, o.config, ruleConfigMapNames, newSSetInputHash, tlsAssets)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to generate statefulset: %w", err)
 	}
 
@@ -561,12 +586,14 @@ func (o *Operator) sync(ctx context.Context, key string) error {
 		logger.Info("recreating ThanosRuler StatefulSet because the update operation wasn't possible", "reason", strings.Join(failMsg, ", "))
 		propagationPolicy := metav1.DeletePropagationForeground
 		if err := ssetClient.Delete(ctx, sset.GetName(), metav1.DeleteOptions{PropagationPolicy: &propagationPolicy}); err != nil {
+			span.RecordError(err)
 			return fmt.Errorf("failed to delete StatefulSet to avoid forbidden action: %w", err)
 		}
 		return nil
 	}
 
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("updating StatefulSet failed: %w", err)
 	}
 
@@ -608,8 +635,12 @@ func (o *Operator) getStatefulSetFromThanosRulerKey(key string) (*appsv1.Statefu
 
 // UpdateStatus implements the operator.Syncer interface.
 func (o *Operator) UpdateStatus(ctx context.Context, key string) error {
+	ctx, span := o.tracer.Start(ctx, "UpdateStatus")
+	defer span.End()
+
 	tr, err := o.getThanosRulerFromKey(key)
 	if err != nil {
+		span.RecordError(err)
 		return err
 	}
 
@@ -619,6 +650,7 @@ func (o *Operator) UpdateStatus(ctx context.Context, key string) error {
 
 	sset, err := o.getStatefulSetFromThanosRulerKey(key)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to get StatefulSet: %w", err)
 	}
 
@@ -628,6 +660,7 @@ func (o *Operator) UpdateStatus(ctx context.Context, key string) error {
 
 	stsReporter, err := operator.NewStatefulSetReporter(ctx, o.kclient, sset)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to retrieve statefulset state: %w", err)
 	}
 
@@ -637,6 +670,7 @@ func (o *Operator) UpdateStatus(ctx context.Context, key string) error {
 	tr.Status.Paused = tr.Spec.Paused
 
 	if _, err = o.mclient.MonitoringV1().ThanosRulers(tr.Namespace).ApplyStatus(ctx, applyConfigurationFromThanosRuler(tr), metav1.ApplyOptions{FieldManager: operator.PrometheusOperatorFieldManager, Force: true}); err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to apply status subresource: %w", err)
 	}
 
@@ -745,6 +779,9 @@ func (o *Operator) enqueueForNamespace(store cache.Store, nsName string) {
 }
 
 func (o *Operator) createOrUpdateWebConfigSecret(ctx context.Context, tr *monitoringv1.ThanosRuler) error {
+	ctx, span := o.tracer.Start(ctx, "createOrUpdateWebConfigSecret", trace.WithAttributes(attribute.String("namespace", tr.Namespace)))
+	defer span.End()
+
 	var fields monitoringv1.WebConfigFileFields
 	if tr.Spec.Web != nil {
 		fields = tr.Spec.Web.WebConfigFileFields
@@ -756,6 +793,7 @@ func (o *Operator) createOrUpdateWebConfigSecret(ctx context.Context, tr *monito
 		fields,
 	)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to initialize the web config: %w", err)
 	}
 
@@ -768,6 +806,7 @@ func (o *Operator) createOrUpdateWebConfigSecret(ctx context.Context, tr *monito
 	)
 
 	if err := webConfig.CreateOrUpdateWebConfigSecret(ctx, o.kclient.CoreV1().Secrets(tr.Namespace), s); err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to update the web config secret: %w", err)
 	}
 
@@ -828,6 +867,9 @@ func makeSelectorLabels(name string) map[string]string {
 }
 
 func (o *Operator) createOrUpdateRulerConfigSecret(ctx context.Context, store *assets.StoreBuilder, tr *monitoringv1.ThanosRuler) error {
+	ctx, span := o.tracer.Start(ctx, "createOrUpdateRulerConfigSecret", trace.WithAttributes(attribute.String("namespace", tr.Namespace)))
+	defer span.End()
+
 	sClient := o.kclient.CoreV1().Secrets(tr.GetNamespace())
 
 	s := &v1.Secret{
@@ -845,16 +887,20 @@ func (o *Operator) createOrUpdateRulerConfigSecret(ctx context.Context, store *a
 	thanosVersion := operator.StringValOrDefault(ptr.Deref(tr.Spec.Version, ""), operator.DefaultThanosVersion)
 	version, err := semver.ParseTolerant(thanosVersion)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to parse Thanos Ruler version %q: %w", thanosVersion, err)
 	}
 
 	if len(tr.Spec.RemoteWrite) > 0 {
 		if version.LT(minRemoteWriteVersion) {
-			return fmt.Errorf("thanos remote-write configuration requires at least version %q: current version %q", minRemoteWriteVersion, version)
+			err := fmt.Errorf("thanos remote-write configuration requires at least version %q: current version %q", minRemoteWriteVersion, version)
+			span.RecordError(err)
+			return err
 		}
 
 		err = prompkg.AddRemoteWritesToStore(ctx, store, tr.Namespace, tr.Spec.RemoteWrite)
 		if err != nil {
+			span.RecordError(err)
 			return err
 		}
 	}
@@ -945,11 +991,13 @@ func (o *Operator) createOrUpdateRulerConfigSecret(ctx context.Context, store *a
 		},
 	)
 	if err != nil {
+		span.RecordError(err)
 		return fmt.Errorf("failed to marshal remote-write configuration: %w", err)
 	}
 	s.Data[rwConfigFile] = rwConfig
 
 	if err = k8sutil.CreateOrUpdateSecret(ctx, sClient, s); err != nil {
+		span.RecordError(err)
 		return err
 	}
 

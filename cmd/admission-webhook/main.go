@@ -24,11 +24,13 @@ import (
 	"syscall"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/common/version"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/prometheus-operator/prometheus-operator/internal/goruntime"
 	logging "github.com/prometheus-operator/prometheus-operator/internal/log"
 	"github.com/prometheus-operator/prometheus-operator/internal/metrics"
+	"github.com/prometheus-operator/prometheus-operator/internal/telemetry"
 	"github.com/prometheus-operator/prometheus-operator/pkg/admission"
 	"github.com/prometheus-operator/prometheus-operator/pkg/server"
 	"github.com/prometheus-operator/prometheus-operator/pkg/versionutil"
@@ -69,6 +71,18 @@ func main() {
 	defer cancel()
 	wg, ctx := errgroup.WithContext(ctx)
 
+	// Initialize OpenTelemetry
+	otelTelemetry, err := telemetry.Setup(ctx, "prometheus-operator-admission-webhook", version.Version, logger)
+	if err != nil {
+		logger.Error("failed to initialize OpenTelemetry", "err", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if err := otelTelemetry.Shutdown(ctx); err != nil {
+			logger.Error("failed to shutdown OpenTelemetry", "err", err)
+		}
+	}()
+
 	mux := http.NewServeMux()
 	admit := admission.New(logger.With("component", "admissionwebhook"))
 	admit.Register(mux)
@@ -82,7 +96,10 @@ func main() {
 		w.Write([]byte(`{"status":"up"}`))
 	})
 
-	srv, err := server.NewServer(logger, &serverConfig, mux)
+	// Wrap the mux with OpenTelemetry HTTP instrumentation
+	instrumentedHandler := telemetry.WrapHTTPMux(mux)
+
+	srv, err := server.NewServer(logger, &serverConfig, instrumentedHandler)
 	if err != nil {
 		logger.Error("failed to create web server", "err", err)
 		os.Exit(1)
