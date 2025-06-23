@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"regexp"
 
 	"go.opentelemetry.io/contrib/exporters/autoexport"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
@@ -33,8 +34,25 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.27.0"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/embedded"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
 	"k8s.io/client-go/rest"
+)
+
+var (
+	// namespacedResourcePathRegex matches Kubernetes API paths for namespaced resources with specific names
+	// Example: /api/v1/namespaces/default/secrets/my-secret -> groups: ["/api/v1", "default", "secrets", "my-secret"]
+	// This should NOT match collection URLs like /api/v1/namespaces/default/secrets
+	namespacedResourcePathRegex = regexp.MustCompile(`^(/api/v[^/]+|/apis/[^/]+/v[^/]+)/namespaces/([^/]+)/([^/]+)/([^/]+)(?:/.*)?$`)
+
+	// namespacedCollectionPathRegex matches Kubernetes API paths for namespaced resource collections
+	// Example: /api/v1/namespaces/default/pods -> groups: ["/api/v1", "default", "pods"]
+	namespacedCollectionPathRegex = regexp.MustCompile(`^(/api/v[^/]+|/apis/[^/]+/v[^/]+)/namespaces/([^/]+)/([^/]+)$`)
+
+	// clusterResourcePathRegex matches Kubernetes API paths for cluster-scoped resources with specific names
+	// Example: /api/v1/nodes/my-node -> groups: ["/api/v1", "nodes", "my-node"]
+	// This should NOT match collection URLs like /api/v1/nodes or namespace-related paths
+	clusterResourcePathRegex = regexp.MustCompile(`^(/api/v[^/]+|/apis/[^/]+/v[^/]+)/([^/]+)/([^/]+)(?:/.*)?$`)
 )
 
 // Telemetry holds the telemetry providers and shutdown functions.
@@ -142,16 +160,43 @@ func WrapHTTPHandler(handler http.Handler, operation string) http.Handler {
 
 // WrapHTTPMux wraps an HTTP mux with OpenTelemetry instrumentation.
 // It adds automatic tracing and metrics for all routes in the mux.
+// Operation names will be in the format "METHOD /path" for better observability.
 func WrapHTTPMux(mux *http.ServeMux) http.Handler {
-	return otelhttp.NewHandler(mux, "http-server")
+	return otelhttp.NewHandler(mux, "",
+		otelhttp.WithSpanNameFormatter(func(operation string, r *http.Request) string {
+			return fmt.Sprintf("%s %s", r.Method, r.URL.Path)
+		}),
+	)
 }
 
 // WrapRoundTripper wraps a Kubernetes client's RoundTripper with OpenTelemetry instrumentation.
-// This provides automatic tracing for all Kubernetes API calls.
+// This provides automatic tracing for all Kubernetes API calls with meaningful operation names.
 func WrapRoundTripper(rt http.RoundTripper, name string) http.RoundTripper {
-	return otelhttp.NewTransport(rt, otelhttp.WithSpanNameFormatter(func(operation string, r *http.Request) string {
-		return fmt.Sprintf("%s %s", name, operation)
-	}))
+	return otelhttp.NewTransport(rt,
+		otelhttp.WithSpanNameFormatter(func(operation string, r *http.Request) string {
+			// Create low-cardinality span names by using placeholders for resource instances
+			// Examples: "GET /api/v1/prometheuses", "PUT /api/v1/namespaces/{namespace}/statefulsets/{name}"
+			path := r.URL.Path
+
+			// Replace specific namespace and resource names with placeholders to reduce cardinality
+			// Pattern: /api/v1/namespaces/{namespace}/resources/{name}
+			if matches := namespacedResourcePathRegex.FindStringSubmatch(path); len(matches) >= 5 {
+				// matches[1] = api version part, matches[2] = namespace, matches[3] = resource type, matches[4] = resource name
+				path = fmt.Sprintf("%s/namespaces/{namespace}/%s/{name}", matches[1], matches[3])
+			} else if matches := namespacedCollectionPathRegex.FindStringSubmatch(path); len(matches) >= 4 {
+				// matches[1] = api version part, matches[2] = namespace, matches[3] = resource type
+				path = fmt.Sprintf("%s/namespaces/{namespace}/%s", matches[1], matches[3])
+			} else if matches := clusterResourcePathRegex.FindStringSubmatch(path); len(matches) >= 4 {
+				// matches[1] = api version part, matches[2] = resource type, matches[3] = resource name
+				// Exclude namespace-related paths which should be handled by the first regex
+				if matches[2] != "namespaces" {
+					path = fmt.Sprintf("%s/%s/{name}", matches[1], matches[2])
+				}
+			}
+
+			return fmt.Sprintf("%s %s", r.Method, path)
+		}),
+	)
 }
 
 // InstrumentKubernetesConfig adds OpenTelemetry instrumentation to a Kubernetes rest.Config.
@@ -159,36 +204,8 @@ func WrapRoundTripper(rt http.RoundTripper, name string) http.RoundTripper {
 func InstrumentKubernetesConfig(config *rest.Config, serviceName string) {
 	// Wrap the existing transport with OTEL instrumentation
 	config.Wrap(func(rt http.RoundTripper) http.RoundTripper {
-		return WrapRoundTripper(rt, serviceName+"-k8s-client")
+		return WrapRoundTripper(rt, serviceName)
 	})
-}
-
-// InstrumentedRoundTripper is an http.RoundTripper that provides
-// OpenTelemetry instrumentation for HTTP requests made by the Kubernetes client.
-type InstrumentedRoundTripper struct {
-	http.RoundTripper
-}
-
-// RoundTrip executes a single HTTP transaction and provides tracing and metrics.
-func (t *InstrumentedRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	_, span := otel.Tracer("k8s.io/client-go").Start(req.Context(), "RoundTrip",
-		trace.WithAttributes(attribute.String("http.method", req.Method), attribute.String("http.url", req.URL.String())))
-	defer span.End()
-
-	// Record additional span attributes from the request
-	span.SetAttributes(attribute.String("k8s.resource", req.URL.Path))
-
-	resp, err := t.RoundTripper.RoundTrip(req)
-	if err != nil {
-		span.RecordError(err)
-		span.SetStatus(codes.Error, "HTTP request failed")
-		return nil, err
-	}
-
-	// Record response status code
-	span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
-
-	return resp, nil
 }
 
 // StartSpan starts a new tracing span with the given name and returns the span and a context
@@ -218,4 +235,28 @@ func GetTracer(name string) trace.Tracer {
 // GetMeter returns a meter for the given name.
 func GetMeter(name string) metric.Meter {
 	return otel.Meter(name)
+}
+
+// GetComponentTracer returns a tracer that automatically adds a component attribute to all spans.
+// This is a convenience function that wraps the regular tracer to add consistent component labeling.
+func GetComponentTracer(name string, component string) trace.Tracer {
+	return &componentTracer{
+		tracer:    otel.Tracer(name),
+		component: component,
+	}
+}
+
+// componentTracer wraps a regular tracer to automatically add component attributes
+type componentTracer struct {
+	embedded.Tracer // Embed to implement the interface
+	tracer          trace.Tracer
+	component       string
+}
+
+// Start creates a span with the component attribute automatically added
+func (ct *componentTracer) Start(ctx context.Context, spanName string, opts ...trace.SpanStartOption) (context.Context, trace.Span) {
+	// Add component attribute to the existing options
+	componentAttr := trace.WithAttributes(attribute.String("component", ct.component))
+	allOpts := append(opts, componentAttr)
+	return ct.tracer.Start(ctx, spanName, allOpts...)
 }
